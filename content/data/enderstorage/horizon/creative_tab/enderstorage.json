@@ -1,0 +1,8 @@
+{
+  "title": "EnderStorage",
+  "icon": "enderstorage:ender_chest",
+  "items": [
+    "enderstorage:ender_chest",
+    "enderstorage:ender_tank"
+  ]
+}

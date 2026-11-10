@@ -1,0 +1,17 @@
+[package]
+# Ported from: EnderStorage 2.13.0 (TheCBProject/EnderStorage, MIT),
+# Minecraft Java 1.21.1 NeoForge. Local-only until the maintainer approves.
+name = "horizon-enderstorage"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "EnderStorage for Horizon: frequency-linked ender chests"
+
+[lib]
+# This exact source is also injected as a same-crate module by horizon-mixins.
+path = "mixins/enderstorage/runtime.rs"
+
+[workspace]
+members = ["tools/audit"]
+resolver = "2"

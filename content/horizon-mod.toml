@@ -1,0 +1,12 @@
+# Port-owned content mod for EnderStorage slice 1: the frequency-linked ender
+# chest. Assets are this port's own (a vanilla ender chest model/texture, no
+# upstream art is shipped); the block/item/recipe/loot/lang are hand-written
+# for 26.3. Licence: MIT (TheCBProject/EnderStorage).
+id = "enderstorage"
+name = "EnderStorage"
+version = "2.13.0"
+description = "Ender chests linked by a three-colour frequency"
+authors = ["covers1624", "ChickenBones"]
+api = "0.2"
+side = "both"
+capabilities = ["registries"]

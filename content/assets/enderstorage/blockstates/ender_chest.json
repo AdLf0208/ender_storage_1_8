@@ -1,0 +1,40 @@
+{
+  "variants": {
+    "facing=down,open=false": {
+      "model": "minecraft:block/ender_chest"
+    },
+    "facing=down,open=true": {
+      "model": "minecraft:block/ender_chest"
+    },
+    "facing=east,open=false": {
+      "model": "minecraft:block/ender_chest"
+    },
+    "facing=east,open=true": {
+      "model": "minecraft:block/ender_chest"
+    },
+    "facing=north,open=false": {
+      "model": "minecraft:block/ender_chest"
+    },
+    "facing=north,open=true": {
+      "model": "minecraft:block/ender_chest"
+    },
+    "facing=south,open=false": {
+      "model": "minecraft:block/ender_chest"
+    },
+    "facing=south,open=true": {
+      "model": "minecraft:block/ender_chest"
+    },
+    "facing=up,open=false": {
+      "model": "minecraft:block/ender_chest"
+    },
+    "facing=up,open=true": {
+      "model": "minecraft:block/ender_chest"
+    },
+    "facing=west,open=false": {
+      "model": "minecraft:block/ender_chest"
+    },
+    "facing=west,open=true": {
+      "model": "minecraft:block/ender_chest"
+    }
+  }
+}

@@ -1,0 +1,257 @@
+[mod]
+id = "enderstorage"
+version = "0.1.0"
+priority = 100
+
+[compatibility]
+horizon_revision = "1d63e0a5a37a7a708eb0b32b49bf0dfeb28ed8a9"
+
+# The pure frequency store and its merge (standalone crate lib, injected as
+# `crate::game::enderstorage`).
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "enderstorage"
+source = "runtime.rs"
+
+# Game-side glue: the block entity, the store file, the dye click and the
+# commands.
+[[module]]
+id = "state"
+file = "crates/horizon-client/src/game.rs"
+name = "enderstorage_state"
+source = "support.rs"
+
+# Before content loads: register the item component that carries a frequency.
+# The content half is inside this bundle (`data/enderstorage-content.hmod`, the built
+# `content/enderstorage.hmod`): this writes it to `.horizon-cache/` and appends it to the dev-mod list, so
+# one `.hnmod` installs the blocks/items and the code. The registry keeps one file per project, so a
+# split port could not be listed; AE2 ships the same pattern (`docs/native-mods.md`, "Data files").
+[[injection]]
+id = "embedded-content"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::mods::content_root"
+helper = "embedded_content.rs"
+bindings = [
+  { name = "root", ty = "&std::path::Path", value = "root" },
+  { name = "enabled", ty = "&std::collections::BTreeSet<String>", value = "enabled" },
+  { name = "dev", ty = "&[std::path::PathBuf]", value = "dev" },
+]
+
+[[injection]]
+id = "component-types"
+hook = "component_types"
+hook_version = 1
+kind = "HEAD"
+helper = "component_types.rs"
+bindings = [
+  { name = "types", ty = "&mut Vec<String>", value = "types" },
+]
+
+# The chest block declares a block entity.
+[[injection]]
+id = "block-entity"
+hook = "block_entity"
+hook_version = 1
+kind = "HEAD"
+helper = "block_entity.rs"
+bindings = [
+  { name = "block", ty = "&str", value = "block" },
+  { name = "entity", ty = "&mut Option<(String, horizon_world::nbt::Compound)>", value = "entity" },
+]
+
+# ... and ticks.
+[[injection]]
+id = "block-entity-ticks"
+hook = "block_entity_ticks"
+hook_version = 1
+kind = "HEAD"
+helper = "ticks.rs"
+bindings = [
+  { name = "block", ty = "&str", value = "block" },
+  { name = "ticks", ty = "&mut bool", value = "ticks" },
+]
+
+# ... with 27 slots and the vanilla 9x3 menu.
+[[injection]]
+id = "block-entity-container"
+hook = "block_entity_container"
+hook_version = 1
+kind = "HEAD"
+helper = "container.rs"
+bindings = [
+  { name = "block", ty = "&str", value = "block" },
+  { name = "container", ty = "&mut Option<horizon_client::containers::ModContainer>", value = "container" },
+]
+
+# The tank block declares one 16-bucket tank, kept in the block entity's
+# saved `fluids` (`native_block_entity_fluids`, API 54).
+[[injection]]
+id = "block-entity-fluids"
+hook = "block_entity_fluids"
+hook_version = 1
+kind = "HEAD"
+helper = "fluids.rs"
+bindings = [
+  { name = "block", ty = "&str", value = "block" },
+  { name = "fluids", ty = "&mut Option<horizon_client::containers::ModFluidTanks>", value = "fluids" },
+]
+
+# A server player pours a water bucket at the tank: one bucket in, no pour
+# (`native_bucket_empty` = API 179).
+[[injection]]
+id = "bucket-empty"
+hook = "bucket_empty"
+hook_version = 1
+kind = "HEAD"
+helper = "bucket.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "u128", value = "player" },
+  { name = "name", ty = "&str", value = "name" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "fluid", ty = "&str", value = "fluid" },
+  { name = "cancel", ty = "&mut bool", value = "cancel" },
+]
+
+# Each tick: mirror the frequency's store into the chest's slots.
+[[injection]]
+id = "block-entity-tick"
+hook = "block_entity_tick"
+hook_version = 1
+kind = "HEAD"
+helper = "tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "entity", ty = "&mut horizon_client::containers::ModBlockEntity", value = "entity" },
+]
+
+# A dye on the chest sets the next colour band (the pin has no sub-hit).
+[[injection]]
+id = "right-click-block"
+hook = "right_click_block"
+hook_version = 1
+kind = "HEAD"
+helper = "right_click.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "face", ty = "[i32; 3]", value = "face" },
+  { name = "canceled", ty = "&mut bool", value = "canceled" },
+]
+
+# A chest placed from an item takes the item's frequency.
+[[injection]]
+id = "place-block"
+hook = "place_block"
+hook_version = 1
+kind = "HEAD"
+helper = "place.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "state", ty = "BlockStateId", value = "state" },
+]
+
+# A broken chest keeps its contents (the store has them) and drops the
+# frequency on its item.
+[[injection]]
+id = "destroy-block"
+hook = "destroy_block"
+hook_version = 1
+kind = "HEAD"
+helper = "destroy.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "state", ty = "BlockStateId", value = "state" },
+  { name = "canceled", ty = "&mut bool", value = "canceled" },
+]
+
+# ... the item drop carries it.
+[[injection]]
+id = "loot-drops"
+hook = "loot_drops"
+hook_version = 1
+kind = "HEAD"
+helper = "loot.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "context", ty = "&NativeLootDrops<'_>", value = "context" },
+  { name = "drops", ty = "&mut Vec<ItemStack>", value = "drops" },
+]
+
+# A blown-up chest must not spill a second copy of the store.
+[[injection]]
+id = "explosion-detonate"
+hook = "explosion_detonate"
+hook_version = 1
+kind = "HEAD"
+helper = "explosion.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "dimension", ty = "&str", value = "dimension" },
+  { name = "blocks", ty = "&mut Vec<[i32; 3]>", value = "blocks" },
+]
+
+# The world opened/closed: load/save the frequency store.
+[[injection]]
+id = "world-lifecycle"
+hook = "world_lifecycle"
+hook_version = 1
+kind = "HEAD"
+helper = "world.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "phase", ty = "WorldPhase", value = "phase" },
+]
+
+# End of a running tick: debounce the store write and re-send changed hands.
+[[injection]]
+id = "server-tick"
+hook = "server_tick"
+hook_version = 1
+kind = "HEAD"
+helper = "server_tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "phase", ty = "ServerTickPhase", value = "phase" },
+]
+
+# Stopping: flush the store.
+[[injection]]
+id = "stopping"
+hook = "server_stopping"
+hook_version = 1
+kind = "HEAD"
+helper = "stopping.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+]
+
+# `/enderstorage freq|info`.
+[[injection]]
+id = "register-commands"
+hook = "register_commands"
+hook_version = 1
+kind = "HEAD"
+helper = "register.rs"
+bindings = [
+  { name = "commands", ty = "&mut Vec<NativeCommand>", value = "commands" },
+]
+
+[[injection]]
+id = "perform-command"
+hook = "perform_command"
+hook_version = 1
+kind = "HEAD"
+helper = "perform.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "&NativeServerPlayer", value = "player" },
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "ran" },
+]
