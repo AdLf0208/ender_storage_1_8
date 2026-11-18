@@ -1,0 +1,20 @@
+[package]
+# Port of EnderStorage 2.13.0 (TheCBProject/EnderStorage, MIT, branch 1.21.1 at
+# d801697cac7493095d8c98b8d4f31a9f6f76f757). Minecraft Java 1.21.1 NeoForge;
+# the port targets Horizon 26.3 at the pin in horizon-mod.toml. Clean-room Rust
+# rewrite from the mod's behaviour (notes.md); local-only until the maintainer
+# approves publishing, publishable under MIT with this source.
+#
+# Cargo's name and version are not the mod's identity: horizon-mod.toml is.
+name = "enderstorage"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+description = "EnderStorage for Horizon: ender chests and ender tanks linked by a three-colour frequency"
+publish = false
+
+[dependencies]
+# The pinned SDK's API crate, fetched into .horizon/sdk/ by any `cargo horizon-mod` command (the
+# launcher builds against its own copy of the same build). Any other registry dependency must be
+# pinned with `horizon-launcher native-lock .` before building.
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }

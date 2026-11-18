@@ -1,0 +1,30 @@
+id = "enderstorage"
+name = "EnderStorage"
+version = "0.2.0"
+description = """A port of EnderStorage for Horizon: ender chests and ender tanks linked by a three-colour
+frequency (left / middle / right wool colours, 4096 combinations). Every chest with the same frequency
+shows the same 27 slots in any dimension, and every tank with the same frequency shares one 16-bucket
+tank; a dye on a chest or /enderstorage freq re-colours it, a bucket fills or drains the tank, and the
+chest or tank item carries its frequency when it is broken or placed. One world-global store per
+frequency is persisted in <world>/enderstorage/frequencies.dat and tanks.dat. The pouch, personal
+(owned) frequencies, the three dye pads, grid crafting that carries colours, the lid animation and the
+custom renderers are not ported yet."""
+authors = ["covers1624", "ChickenBones", "Christopher R. Thompson (Ecu)", "AdLf0208"]
+# The original's licence: MIT (TheCBProject/EnderStorage); its text and copyright
+# notice travel inside the package as LICENSE / LICENSE-NOTICE.md.
+# A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
+# beside data/ and assets/. The id is the resource namespace and the only identity: Cargo's
+# package name and version are not the mod's.
+api = "0.2"
+# The installation side, not the hook's: the store and the block entities run on the server, and
+# single player's integrated server belongs to the client installation, so "both".
+side = "both"
+# The one shared value every manifest carries ("May add blocks, items, mob effects and entity
+# types"): this mod declares the chest and tank blocks, their items, recipes, loot, the creative
+# tab and the enderstorage:frequency item component.
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
