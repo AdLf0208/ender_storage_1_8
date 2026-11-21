@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# In-game check for EnderStorage slice 1 (frequency-linked ender chests).
+# In-game check for EnderStorage (frequency-linked chests and the shared tank).
 #
-# The End arena (stone floor at y=63, chests at y=64). Every mod command is
+# The End arena (stone floor at y=63, blocks at y=64). Every mod command is
 # typed with `ctl chat "/cmd"` because `ctl command` runs the console path and
-# bypasses the native `perform_command` hook.
+# bypasses the native `perform_command` hook. `SCRATCH` lives under `E2E_TMP`
+# (the launcher exports one on /home): `/tmp` is a 7.5 GB tmpfs.
 #
 # Default run:
 #  - two chests on the default white/white/white frequency share 27 slots: a
@@ -20,7 +21,14 @@
 #  - an item given a blue frequency places a chest that shows the blue store's
 #    items;
 #  - a vanilla barrel never shares (differential control);
-#  - the store file survives `save` + relaunch.
+#  - a water bucket at a tank hits the recorded pin gap (it stays empty, nothing
+#    is poured), and the tank's store is stocked through the block entity's own
+#    compound, where the port keeps it;
+#  - 0.2.4 bug 2: a tank placed from an item on a stocked frequency keeps the
+#    shared 4,000 mB, and both tanks read it;
+#  - 0.2.4 bug 1: a stack of eight empty buckets drains one bucket, keeps seven
+#    and gains one full bucket (the vanilla cauldron does the same);
+#  - both store files survive `save` + relaunch.
 #
 # SELFTEST=1 flips the sharing assertion (it must FAIL), proving the scenario
 # can fail. `NEGATIVE=1` is not used.
@@ -51,7 +59,7 @@ WORLD=EnderStorageE2E
 [ -x "$GAME" ] || { echo "missing horizon-client: $GAME" >&2; exit 1; }
 [ -d "$RES/assets" ] || { echo "missing prepared resources: $RES" >&2; exit 1; }
 
-SCRATCH=$(mktemp -d /tmp/opencode/enderstorage-home.XXXXXX)
+SCRATCH=$(mktemp -d "${E2E_TMP:-/tmp/opencode}/enderstorage-home.XXXXXX")
 export HORIZON_HOME=$SCRATCH/game
 export HORIZON_LAUNCHER_HOME=$SCRATCH/launcher
 export XDG_DATA_HOME=$SCRATCH/data
@@ -281,15 +289,14 @@ has 12 64 0 minecraft:emerald 3
 has 12 64 0 minecraft:stick 0
 has 16 64 0 minecraft:emerald 0
 
-echo "== the tank: the declared fluid tank at this pin (recorded gap) =="
-# GAP, measured at Horizon 0b14f8a: a bucket emptied into a mod-declared fluid tank does not keep
-# its fluid. The engine's own bucket path empties the item and the fluid is gone by the next tick
-# (`horizon:fluids` -> `FluidTanks::insert`: a 1000 mB insert reads back inside the call and the
-# tank holds 0 after the tick; 500 mB held once and then refused the next 500). The port cannot
+echo "== the tank: a water bucket at a tank (the recorded bucket-fill gap) =="
+# GAP, measured at 0b14f8a and still true at 0a875da: the engine's own bucket path empties the
+# item before the mod can refuse it, and `horizon:fluids` -> `FluidTanks::insert` loses the write
+# (1000 mB reads back inside the call and the tank holds 0 after the tick). The port cannot
 # intercept the bucket before that path, so the scenario asserts what the tank *does* here — it
-# stays empty, the other tanks of the channel stay empty, and nothing is poured into the world —
-# rather than pretending the bucket fills it. See notes.md, "Gap: the declared tank at 0b14f8a".
-# When a pin keeps the fluid, this section fails and must be rewritten to the real assertion.
+# stays empty, the other tanks of the channel stay empty, and nothing is poured into the world.
+# The store is stocked below through the block entity's own compound (where the port keeps the
+# tank), which is how the shared-fluid legs become provable on this pin.
 ctl command "execute in minecraft:the_end run setblock 18 64 0 enderstorage:ender_tank"
 ctl command "execute in minecraft:the_end run setblock 22 64 0 enderstorage:ender_tank"
 ctl command "execute in minecraft:the_end run setblock 20 64 4 enderstorage:ender_tank"
@@ -316,25 +323,75 @@ pour=$(ctl block 18 65 0 | jq -r '.name // .block // empty')
 [ "$pour" != "minecraft:water" ] || fail "the bucket poured into the world beside the tank"
 echo "  beside the tank: $pour"
 
-echo "== an empty bucket on the tank fills nothing (same gap) =="
+echo "== bug 2: a tank placed from an item on a stocked frequency keeps the shared fluid =="
+# 0.2.3 lost it: the placement switched the tank, recorded the store's tank as its snapshot
+# without writing it into the entity, and the next tick read the entity's empty tank and
+# subtracted the whole 4,000 mB from the store (tanks.dat `red,white,white - 0`). The compound
+# write stocks the frequency; the red frequency differs from a fresh tank's white default, so
+# the placement's pending switch is the path that lost it.
 ctl command "gamemode creative" >/dev/null
-ctl wait 4
 ctl command "clear @s" >/dev/null
-ctl give minecraft:bucket 1
+say "enderstorage freq 18 64 0 red white white"
+ctl wait 10
+ctl command 'execute in minecraft:the_end run data merge block 18 64 0 {fluids:[{Fluid:"minecraft:water",Amount:4000}]}'
+ctl wait 10
+expect_info 18 64 0 "minecraft:water 4000 mB, 4000 mB in the store"
+ctl give enderstorage:ender_tank 1
+ctl wait 4
+ctl select enderstorage:ender_tank
+ctl wait 4
+say "enderstorage freq held red white white"
+ctl wait 6
+ctl command "execute in minecraft:the_end run tp @s 15.5 64 2.5"
+ctl wait 6
+ctl place 14 64 0
+ctl wait 20
+expect_info 18 64 0 "minecraft:water 4000 mB, 4000 mB in the store"
+expect_info 14 64 0 "minecraft:water 4000 mB, 4000 mB in the store"
+TANKS="$SCRATCH/saves/$WORLD/enderstorage/tanks.dat"
+ctl save >/dev/null 2>&1 || true
+grep -q 't red,white,white minecraft:water 4000' "$TANKS" \
+    || fail "placing the second tank erased the shared fluid: $(cat "$TANKS" 2>/dev/null)"
+echo "  tanks.dat after the second tank: $(grep 't red' "$TANKS")"
+
+echo "== bug 1: an empty bucket drains one bucket and the rest of the stack survives =="
+# 0.2.3 replaced the whole held stack with one full bucket: eight empty buckets became one item.
+# A fresh tank stocks the white frequency through its compound, as above.
+ctl command "execute in minecraft:the_end run setblock 20 64 0 enderstorage:ender_tank"
+ctl wait 10
+ctl command 'execute in minecraft:the_end run data merge block 20 64 0 {fluids:[{Fluid:"minecraft:water",Amount:4000}]}'
+ctl wait 10
+ctl command "execute in minecraft:the_end run tp @s 21.5 64 2.5"
+ctl wait 6
+expect_info 20 64 0 "minecraft:water 4000 mB, 4000 mB in the store"
+ctl command "gamemode survival" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl give minecraft:bucket 8
 ctl wait 4
 ctl select minecraft:bucket
 ctl wait 4
-ctl interact 18 64 0
-ctl wait 10
-expect_info 18 64 0 "empty 0 mB"
-ctl inventory | jq -e '([(.hotbar // [])[], (.main // [])[]] | map(select(. != null and .item == "minecraft:water_bucket")) | length) == 0' >/dev/null \
-    || fail "an empty bucket filled from an empty tank: $(ctl inventory | jq -c '{hotbar,main}')"
+ctl command "execute in minecraft:the_end run tp @s 21.5 64 2.5"
+ctl wait 6
+ctl interact 20 64 0
+ctl wait 20
+inv=$(ctl inventory)
+buckets=$(jq '[ (.hotbar // [])[], (.main // [])[] | select(. != null and .item == "minecraft:bucket") | .count ] | add // 0' <<<"$inv")
+full=$(jq '[ (.hotbar // [])[], (.main // [])[] | select(. != null and .item == "minecraft:water_bucket") | .count ] | add // 0' <<<"$inv")
+echo "  inventory after the drain: $buckets empty + $full full"
+[ "$buckets" = 7 ] || fail "the stack lost buckets: expected 7 empty buckets left, got $buckets ($(jq -c '{hotbar,main}' <<<"$inv"))"
+[ "$full" = 1 ] || fail "the drain did not produce one full bucket: got $full ($(jq -c '{hotbar,main}' <<<"$inv"))"
+expect_info 20 64 0 "minecraft:water 3000 mB, 3000 mB in the store"
+ctl save >/dev/null 2>&1 || true
+grep -q 't white,white,white minecraft:water 3000' "$TANKS" \
+    || fail "the drain did not reach the tank's frequency: $(grep 't white' "$TANKS")"
+echo "  tanks.dat after the drain: $(grep 't white,white,white minecraft:water' "$TANKS")"
 
-echo "== a vanilla cauldron still takes the bucket (differential control) =="
+echo "== a vanilla cauldron still takes the bucket and keeps the stack (differential control) =="
 ctl command "execute in minecraft:the_end run setblock 20 64 6 minecraft:cauldron"
 ctl wait 4
 ctl command "execute in minecraft:the_end run tp @s 20.5 64 8.5"
 ctl wait 6
+ctl command "clear @s" >/dev/null
 ctl give minecraft:water_bucket 1
 ctl wait 4
 ctl select minecraft:water_bucket
@@ -345,19 +402,14 @@ state=$(ctl block 20 64 6 | jq -r '.name // .block // empty')
 [ "$state" = "minecraft:water_cauldron" ] \
     || fail "the vanilla cauldron did not take the water (state=$state)"
 echo "  cauldron state: $state"
-expect_info 18 64 0 "empty 0 mB"
+expect_info 18 64 0 "minecraft:water 4000 mB"
 
 echo "== the store file exists and survives a relaunch =="
 STORE="$SCRATCH/saves/$WORLD/enderstorage/frequencies.dat"
 [ -s "$STORE" ] || fail "missing store file $STORE"
 grep -q 'f blue,blue,blue' "$STORE" || fail "the store file has no blue frequency: $(head -20 "$STORE")"
 echo "  frequencies.dat: $(grep 'f blue,blue,blue' "$STORE")"
-TANKS="$SCRATCH/saves/$WORLD/enderstorage/tanks.dat"
 [ -s "$TANKS" ] || fail "missing tank file $TANKS"
-# The tank never held anything, so the tank file has no water line for its frequency.
-if grep -q 't white,white,white minecraft:water' "$TANKS"; then
-    fail "the tank file claims water the tank never kept: $(head -20 "$TANKS")"
-fi
 echo "  tanks.dat: $(head -5 "$TANKS" | tr '\n' ' ')"
 ctl save >/dev/null
 ctl quit >/dev/null 2>&1 || true
@@ -365,7 +417,8 @@ sleep 3
 launch
 has 12 64 0 minecraft:emerald 3
 has 0 64 0 minecraft:diamond 5
-expect_info 18 64 0 "empty 0 mB"
-expect_info 22 64 0 "empty 0 mB"
+expect_info 18 64 0 "minecraft:water 4000 mB"
+expect_info 20 64 0 "minecraft:water 3000 mB"
 
-echo "PASS: same-frequency chests shared 27 slots, a different frequency stayed isolated, the 27-slot menu opened, a dye click set a band and consumed the dye, re-colouring committed to the old frequency, a broken chest dropped its frequency without spilling, an item placed a chest on the blue store, a vanilla barrel never shared, the tank channel and its three blocks stayed separate and empty (the declared tank keeps no fluid at this pin: recorded gap), a bucket never poured into the world, a vanilla cauldron still took the bucket, and both store files survived a relaunch"
+echo "PASS: same-frequency chests shared 27 slots, a different frequency stayed isolated, the 27-slot menu opened, a dye click set a band and consumed the dye, re-colouring committed to the old frequency, a broken chest dropped its frequency without spilling, an item placed a chest on the blue store, a vanilla barrel never shared, a water bucket at a tank still hits the recorded fill gap, a tank placed from an item on a stocked frequency kept the shared 4,000 mB on both tanks, a stack of eight empty buckets drained one bucket and kept the other seven (and a vanilla cauldron did the same), and both store files survived a relaunch"
+exit 0

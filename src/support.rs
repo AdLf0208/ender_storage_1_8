@@ -31,8 +31,8 @@ use mod_api::{
 };
 
 use crate::runtime::{
-    BUCKET, Band, Colour, Frequency, SLOTS, Slot, Store, TANK_CAPACITY, Tank, TankStore, commit,
-    commit_tank, may_read, switch, switch_tank, sync, sync_tank,
+    BUCKET, Band, Colour, Frequency, SLOTS, Slot, Store, TANK_CAPACITY, Tank, TankStore,
+    bucket_swap, commit, commit_tank, may_read, switch, switch_tank, sync, sync_tank, tank_write,
 };
 
 /// The chest block and its item; the tank block and its item (each pair shares one id).
@@ -885,7 +885,11 @@ fn tick_tank(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     let dimension = host.dimension().to_owned();
     let mut frequency = be_frequency(&mut event.entity.nbt);
     let uid = be_uid(&mut event.entity.nbt);
-    let mut current = read_be_tank(&event.entity.nbt);
+    // What the entity holds before this tick. It is the value the next tick reads, so the
+    // snapshot kept below is only honest once the entity takes the merged tank.
+    let held = read_be_tank(&event.entity.nbt);
+    let mut current = held.clone();
+    let mut switched: Option<Tank> = None;
     {
         let mut guard = core();
         let state = guard.get_or_insert_with(Core::default);
@@ -907,21 +911,24 @@ fn tick_tank(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
                 if changed {
                     state.tanks_dirty = true;
                 }
-                current = tank;
-                state.tank_snapshots.insert(uid, current.clone());
+                current = tank.clone();
+                switched = Some(tank);
                 set_be_frequency(&mut event.entity.nbt, wanted);
                 frequency = wanted;
             }
         }
-        let snapshot = state.tank_snapshots.get(&uid).cloned();
-        let synced = sync_tank(&current, snapshot.as_ref(), &mut state.tanks, frequency);
+        // The switched tank belongs to the new frequency and is not merged against the old
+        // frequency's snapshot; it is shown as it stands.
+        let snapshot = switched.as_ref().or_else(|| state.tank_snapshots.get(&uid));
+        let synced = sync_tank(&current, snapshot, &mut state.tanks, frequency);
         if synced.store_changed {
             state.tanks_dirty = true;
         }
-        if synced.tank != current {
-            write_be_tank(&mut event.entity.nbt, &synced.tank);
+        let written = tank_write(&held, synced.tank);
+        if written.write {
+            write_be_tank(&mut event.entity.nbt, &written.tank);
         }
-        state.tank_snapshots.insert(uid, synced.tank);
+        state.tank_snapshots.insert(uid, written.tank);
     }
 }
 
@@ -1192,15 +1199,15 @@ fn queue_frequency(host: &mut dyn ServerHost, pos: [i32; 3], frequency: Frequenc
 // ---------------------------------------------------------------------------
 
 /// A right click with a dye sets the chest's next colour band and consumes one dye; a right click
-/// with a bucket fills or drains the tank. Both claim the click, so no menu opens and no fluid is
-/// poured into the world.
+/// with a bucket belongs to the tank. Both claim the click, so no menu opens and no fluid is poured
+/// into the world. The bucket's exchange is not done here: the bucket's own use (`fill_bucket`)
+/// runs one phase later, and swapping the hand in both places produced two buckets per click.
 pub fn right_click(host: HostSide<'_>, event: &mut mod_api::RightClickBlockEvent<'_>) -> Flow {
     if event.cancelled || event.click.hand != Hand::Main {
         return Flow::Continue;
     }
     let click = event.click;
     let pos = click.pos;
-    let face = click.hit.face;
     let Some(held) = click.stack.cloned() else {
         return Flow::Continue;
     };
@@ -1217,7 +1224,9 @@ pub fn right_click(host: HostSide<'_>, event: &mut mod_api::RightClickBlockEvent
         .block_state(&*server, pos)
         .and_then(|state| block_kind(&*server, state));
     let claimed = match here {
-        Some(Kind::Tank) => tank_bucket_click(server, player, level, pos, face, &held),
+        // The bucket's own use (`fill_bucket`) swaps it; this click only claims the tank so no
+        // menu opens and nothing is poured.
+        Some(Kind::Tank) => bucket_click(&*server, &held),
         Some(Kind::Chest) => dye_click(server, player, level, pos, &held),
         None => false,
     };
@@ -1229,9 +1238,11 @@ pub fn right_click(host: HostSide<'_>, event: &mut mod_api::RightClickBlockEvent
     }
 }
 
-/// A server player empties a water bucket at the tank: one bucket goes into the shared tank and
-/// nothing is poured. The hook carries the fluid target, not the clicked face, so the insert uses
-/// the `up` side (the tank's table reaches every side).
+/// A server player uses a bucket at the tank: an empty bucket draws one whole bucket out of the
+/// shared tank and a full bucket puts one in, the held stack gives up (or gains) exactly one item,
+/// and nothing is poured beside the block. The swap lives here, in the click's item phase, so the
+/// engine's own one item use cannot repeat it. The hook carries the fluid target, not the clicked
+/// face, so the tank is reached through the `up` side (its table takes every side).
 pub fn fill_bucket(host: &mut dyn ServerHost, event: &mut mod_api::FillBucketEvent<'_>) -> Flow {
     if event.cancelled {
         return Flow::Continue;
@@ -1269,19 +1280,6 @@ pub fn fill_bucket(host: &mut dyn ServerHost, event: &mut mod_api::FillBucketEve
     Flow::Cancel
 }
 
-/// The face of a click as a `Direction`, for the fluid capability's side.
-fn face_direction(face: [i32; 3]) -> Option<mod_api::Direction> {
-    match face {
-        [0, -1, 0] => Some(mod_api::Direction::Down),
-        [0, 1, 0] => Some(mod_api::Direction::Up),
-        [0, 0, -1] => Some(mod_api::Direction::North),
-        [0, 0, 1] => Some(mod_api::Direction::South),
-        [-1, 0, 0] => Some(mod_api::Direction::West),
-        [1, 0, 0] => Some(mod_api::Direction::East),
-        _ => None,
-    }
-}
-
 /// The fluid a filled bucket holds.
 fn bucket_fluid(host: &dyn Host, stack: &ItemStack) -> Option<&'static str> {
     match stack.item().id(host).as_str() {
@@ -1300,42 +1298,14 @@ fn fluid_bucket(fluid: &str) -> Option<&'static str> {
     }
 }
 
-/// A right click on a tank with a bucket swaps a bucket between the tank and the held stack;
-/// whether the click was the tank's (the caller then claims it).
-fn tank_bucket_click(
-    host: &mut dyn ServerHost,
-    player: PlayerRef,
-    level: LevelRef,
-    pos: [i32; 3],
-    face: [i32; 3],
-    held: &ItemStack,
-) -> bool {
-    let Some(direction) = face_direction(face) else {
-        return false;
-    };
-    let empty = held.item().id(&*host) == BUCKET_ITEM;
-    let filled_with = bucket_fluid(&*host, held);
-    if !empty && filled_with.is_none() {
-        return false;
-    }
-    let done = host.transaction(|host, tx| {
-        let done = if let Some(fluid) = filled_with {
-            // A filled bucket: one bucket in and the held stack becomes an empty bucket. A tank
-            // that will not take the whole bucket leaves both alone, and the click is still ours.
-            fill_tank(host, tx, level, pos, fluid, player)
-        } else {
-            // An empty bucket: only a whole bucket fills a bucket, so a partly filled tank
-            // refuses.
-            drain_tank(host, tx, level, pos, Some(direction), player)
-        };
-        if done { Ok::<bool, ()>(true) } else { Err(()) }
-    });
-    let _ = done;
-    true
+/// Whether a right click on a tank with `held` is the tank's: a bucket of either kind is.
+fn bucket_click(host: &dyn Host, held: &ItemStack) -> bool {
+    held.item().id(host) == BUCKET_ITEM || bucket_fluid(host, held).is_some()
 }
 
-/// Put one bucket of `fluid` into the tank at `pos` and turn the held bucket into an empty one;
-/// whether it went in.
+/// Put one bucket of `fluid` into the tank at `pos` and turn one held bucket into an empty one;
+/// whether it went in. At this pin the declared tank keeps no insert, so the caller's transaction
+/// rolls the swap back with the missing fluid; the recorded gap is in `notes.md`.
 fn fill_tank(
     host: &mut dyn ServerHost,
     tx: &Transaction,
@@ -1378,8 +1348,9 @@ fn fill_tank(
     }
 }
 
-/// Take one whole bucket out of the tank at `pos` into the held empty bucket; whether it came out.
-/// A partial draw is put back, because an empty bucket holds no fraction.
+/// Take one whole bucket out of the tank at `pos` into the held empty bucket — the stack keeps its
+/// other items (`runtime::bucket_swap`); whether the draw came out. A partial draw is put back,
+/// because an empty bucket holds no fraction.
 fn drain_tank(
     host: &mut dyn ServerHost,
     tx: &Transaction,
@@ -1423,7 +1394,7 @@ fn bucket_volume() -> u32 {
 }
 
 /// Replace one held `from` with one `to` (a bucket swap) in the hand that holds it, and answer
-/// whether the slot write succeeded.
+/// whether the write succeeded.
 ///
 /// The hand is read from the inventory, not assumed: the selected hotbar slot first, then the off
 /// hand (`Inventory`'s 40), then any other slot still holding the item. `fill_bucket` has no hand
@@ -1431,40 +1402,71 @@ fn bucket_volume() -> u32 {
 /// unchanged and the main-hand item destroyed. The swap fails (rather than silently doing
 /// nothing) when the item is not there or the write is refused, so the caller rolls the fluid
 /// change back.
+///
+/// A stack gives up **one** item: eight empty buckets drained at a tank leave seven empty buckets
+/// and one full bucket in the inventory (`runtime::bucket_swap`), as vanilla's
+/// `ItemUtils.createFilledResult` fills one. Only the last item lets the produced bucket take the
+/// hand's slot; a stack that merely replaced its whole slot lost the other seven buckets.
 fn swap_held(host: &mut dyn ServerHost, player: PlayerRef, from: &str, to: &str) -> bool {
-    let Some(slot) = holding_slot(host, player, from) else {
+    let Some((slot, stack)) = holding_stack(host, player, from) else {
+        return false;
+    };
+    let Some(swap) = bucket_swap(stack.count()) else {
         return false;
     };
     let Some(key) = Identifier::parse(to).ok().and_then(|id| host.item_key(&id)) else {
         return false;
     };
-    let Some(stack) = ItemStack::new(key, 1) else {
+    if swap.into_hand {
+        let Some(produced) = ItemStack::new(key, 1) else {
+            return false;
+        };
+        return player
+            .set_inventory_slot(host, slot, Some(produced))
+            .is_ok();
+    }
+    let mut rest = stack.clone();
+    if rest.set_count(swap.kept).is_err() {
+        return false;
+    }
+    if player.set_inventory_slot(host, slot, Some(rest)).is_err() {
+        return false;
+    }
+    let Some(produced) = ItemStack::new(key, 1) else {
         return false;
     };
-    player.set_inventory_slot(host, slot, Some(stack)).is_ok()
+    if player.give_stack(host, produced).is_err() {
+        // The hand is put back so the caller's transaction leaves it as it was: no fluid for a
+        // bucket that was never produced.
+        let _ = player.set_inventory_slot(host, slot, Some(stack));
+        return false;
+    }
+    true
 }
 
-/// The slot holding `item`: the selected slot, then the off hand, then any other slot.
-fn holding_slot(host: &dyn ServerHost, player: PlayerRef, item: &str) -> Option<u32> {
+/// The slot and the stack holding `item`: the selected slot, then the off hand, then any other
+/// slot.
+fn holding_stack(host: &dyn ServerHost, player: PlayerRef, item: &str) -> Option<(u32, ItemStack)> {
     let selected = u32::try_from(player.selected_slot(host)?).ok();
     let slots = player.inventory_slots(host)?;
     let holds = |slot: u32| {
         slots
             .iter()
-            .any(|(at, stack)| *at == slot && stack.item().id(host) == item)
+            .find(|(at, stack)| *at == slot && stack.item().id(host) == item)
+            .map(|(_, stack)| stack.clone())
     };
     if let Some(slot) = selected
-        && holds(slot)
+        && let Some(stack) = holds(slot)
     {
-        return Some(slot);
+        return Some((slot, stack));
     }
-    if holds(OFF_HAND) {
-        return Some(OFF_HAND);
+    if let Some(stack) = holds(OFF_HAND) {
+        return Some((OFF_HAND, stack));
     }
     slots
         .iter()
         .find(|(_, stack)| stack.item().id(host) == item)
-        .map(|(slot, _)| *slot)
+        .map(|(slot, stack)| (*slot, stack.clone()))
 }
 
 /// The player's main-hand stack and the slot it is in.
@@ -1987,17 +1989,6 @@ mod tests {
             })])),
             "the declaration's shape is kept, one entry per tank"
         );
-    }
-
-    #[test]
-    fn a_clicked_face_is_the_direction_the_tank_is_reached_through() {
-        assert_eq!(face_direction([0, 1, 0]), Some(mod_api::Direction::Up));
-        assert_eq!(face_direction([0, -1, 0]), Some(mod_api::Direction::Down));
-        assert_eq!(face_direction([0, 0, -1]), Some(mod_api::Direction::North));
-        assert_eq!(face_direction([0, 0, 1]), Some(mod_api::Direction::South));
-        assert_eq!(face_direction([-1, 0, 0]), Some(mod_api::Direction::West));
-        assert_eq!(face_direction([1, 0, 0]), Some(mod_api::Direction::East));
-        assert_eq!(face_direction([0, 0, 0]), None, "no face is not a side");
     }
 
     #[test]

@@ -866,6 +866,52 @@ pub fn switch_tank(
     (store.tank(to), changed)
 }
 
+/// What one tank tick leaves in the block entity: the tank, and whether the
+/// entity has to be written with it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TankWrite {
+    /// The tank the entity holds after the tick.
+    pub tank: Tank,
+    /// The entity's saved compound has to take `tank` (it held another value).
+    pub write: bool,
+}
+
+/// The tank a tick keeps and writes: `merged` unless the entity already holds
+/// it. A snapshot is only ever the tank the entity holds, so the write and the
+/// snapshot are one value. Recording a snapshot the entity does not hold would
+/// make the next tick read the entity's old tank as a local change and apply
+/// the difference to the store: a tank placed on a stocked frequency would
+/// subtract the whole shared amount on its second tick.
+pub fn tank_write(entity: &Tank, merged: Tank) -> TankWrite {
+    TankWrite {
+        write: entity != &merged,
+        tank: merged,
+    }
+}
+
+/// What one held stack leaves after a bucket swap: the count the hand keeps and
+/// whether the produced bucket takes the hand's slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BucketSwap {
+    /// What the held slot keeps; 0 leaves it empty.
+    pub kept: u32,
+    /// The produced bucket goes into the hand's slot because nothing was left
+    /// behind it.
+    pub into_hand: bool,
+}
+
+/// One item of a held stack becomes a bucket (vanilla's
+/// `ItemUtils.createFilledResult`): the stack keeps its other items and the
+/// produced bucket goes to the inventory, unless the item was the last one, in
+/// which case the bucket takes the hand's slot. None when the stack is empty.
+pub fn bucket_swap(held_count: u32) -> Option<BucketSwap> {
+    let kept = held_count.checked_sub(1)?;
+    Some(BucketSwap {
+        kept,
+        into_hand: kept == 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1446,5 +1492,46 @@ mod tank_tests {
         let mut store = TankStore::new();
         assert!(!commit_tank(&water(1_000), None, &mut store, RED));
         assert!(!store.contains(RED));
+    }
+
+    #[test]
+    fn a_tank_the_entity_does_not_hold_is_written_with_its_snapshot() {
+        // A tank placed from an item adopts the store's 4,000 mB while its own compound still
+        // holds nothing: the tick must write it. Keeping a snapshot of a tank the entity does
+        // not hold makes the next tick read the empty tank and subtract the 4,000 from the
+        // store, which erases the shared fluid.
+        let adopted = tank_write(&Tank::EMPTY, water(4_000));
+        assert!(
+            adopted.write,
+            "the entity's empty tank is not the shown one"
+        );
+        assert_eq!(adopted.tank, water(4_000));
+        let unchanged = tank_write(&water(4_000), water(4_000));
+        assert!(!unchanged.write);
+        assert_eq!(unchanged.tank, water(4_000));
+        let emptied = tank_write(&water(1_000), Tank::EMPTY);
+        assert!(emptied.write);
+        assert_eq!(emptied.tank, Tank::EMPTY);
+    }
+
+    #[test]
+    fn a_bucket_swap_keeps_the_rest_of_the_stack() {
+        // Eight empty buckets: one becomes the filled bucket, seven stay in the hand.
+        assert_eq!(
+            bucket_swap(8),
+            Some(BucketSwap {
+                kept: 7,
+                into_hand: false
+            })
+        );
+        // The last bucket: the produced one takes the hand's slot.
+        assert_eq!(
+            bucket_swap(1),
+            Some(BucketSwap {
+                kept: 0,
+                into_hand: true
+            })
+        );
+        assert_eq!(bucket_swap(0), None, "an empty hand has nothing to swap");
     }
 }

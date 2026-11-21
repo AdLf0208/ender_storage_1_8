@@ -798,3 +798,134 @@ and `SELFTEST=1` inverts the expectation and ends `FAIL` + `EXIT:1` (`e2e-dialec
 Package 0.2.3: **53,203 B**, SHA-256 `9ad59a8b9d0981471497eea8e26196b1b1460e0327b7bb298148c3229a8f62b7`.
 
 Skills: superpowers/using-superpowers,systematic-debugging,test-driven-development,verification-before-completion; BeautifulRust/none (no Rust change)
+
+## Reviewer repairs (2026-11-21) — PR #1538: two inventory-loss cases (0.2.4)
+
+The reviewer of PR #1538 (`levzzz5154`) read the bucket and tank glue and reported:
+
+> The repaired recipe exposes two inventory-loss cases: filling from a stack of empty buckets replaces
+> the whole stack, and placing a tank on a stocked frequency can erase the shared fluid because the
+> code records the snapshot before initializing the tank. Preserve the other empty buckets and
+> initialize the tank before taking the snapshot.
+
+Both were reproduced on the **delivered 0.2.3 package** at the campaign pin before any edit, and a
+third one surfaced while fixing the first two.
+
+### Red 1 — a stack of empty buckets loses the rest of the stack (`runner`, quoted)
+
+Probe `ports/_shared/evidence/enderstorage/probe-bug1-stack-0.2.3.sh` on a launcher-built 0.2.3 game
+(`red-bug1-stack-0.2.3.log`). The tank's compound is stocked with 4000 mB (the pin's bucket *fill*
+path keeps no write, so the compound is where the port's tank lives), then one empty-bucket click
+with a stack of eight:
+
+```
+  before: [{"item":"minecraft:bucket","count":8}, …]
+  after:  [{"item":"minecraft:bucket","count":1}, …]
+  tanks.dat: # enderstorage-tanks 1 t white,white,white minecraft:water 3000
+```
+
+Eight buckets became **one** item and the seven others were destroyed (and no full bucket was in the
+hand: `swap_held` had replaced the whole slot). Root cause: `support::swap_held` wrote
+`ItemStack::new(key, 1)` over the held slot, whatever its count.
+
+### Red 2 — a tank placed on a stocked frequency erases the shared fluid (`runner`, quoted)
+
+Probe `…/probe-bug2-tank-0.2.3.sh` (`red-bug2-tank-0.2.3.log`): stock `red,white,white` with 4000 mB,
+then place a second tank at `4,64,0` from a tank item carrying `red,white,white` (so the placement's
+pending frequency differs from the fresh entity's white default and the tick's switch runs):
+
+```
+  info A: Ender Tank: red / white / white (minecraft:water 4000 mB, 4000 mB in the store)
+  data B right after: … id: "enderstorage:ender_tank", frequency: "red,white,white"      <- no fluids
+  t+~8  info A: Ender Tank: red / white / white (empty 0 mB, 0 mB in the store)
+  data A: … fluids: [{Amount: 0, Fluid: "minecraft:empty"}], frequency: "red,white,white"
+  tanks.dat: # enderstorage-tanks 1 … t red,white,white - 0
+```
+
+Root cause: `support::tick_tank`'s pending-frequency branch set `current` to the switched (store)
+tank and recorded it as the entity's snapshot, but the write-back was gated on
+`synced.tank != current` — with `synced.tank == current` the entity's compound was never written. On
+the next tick the entity read its old empty tank, the merge treated it as a local change from the
+recorded 4000 mB snapshot, and subtracted the whole 4000 from the store.
+
+### Red 3 — one click exchanged two buckets (found by the fix, quoted)
+
+With the hand swap written in `right_click_block`, the item's own use ran a second exchange on the
+already-swapped hand: eight empty buckets ended `6 empty + 2 full` for one 1000 mB draw
+(`probe-double-exchange-0.2.4.log`) — the stack survived, but a bucket of fluid was duplicated.
+Claiming the click with `Success`/`Fail`/`Consume`, and writing the produced bucket through
+`give_stack` or a free slot, all reproduced it; the one shape that does not is doing the swap in
+`fill_bucket` (the bucket's own use), which is where it now lives
+(`probe-bug1-after-0.2.4.log`: `7 empty + 1 full`, `info A … 4000 → 3000`).
+
+### Fixes
+
+- **`runtime::tank_write(entity, merged) -> TankWrite`** (new, with `a_tank_the_entity_does_not_hold_is_written_with_its_snapshot`):
+  the tank one tick keeps is `merged`, and it **must be written** when the entity does not already
+  hold it; the snapshot is that same value. `tick_tank` reads the entity's tank once (`held`) and uses
+  `tank_write(&held, synced.tank)` for both the write and the snapshot, and passes the switched tank
+  to `sync_tank` as the snapshot for the new frequency instead of inserting it early.
+- **`runtime::bucket_swap(held_count) -> Option<BucketSwap>`** (new, with
+  `a_bucket_swap_keeps_the_rest_of_the_stack`): one item of a stack becomes a bucket, the rest stay in
+  the hand, and only the last item lets the produced bucket take the hand's slot (vanilla's
+  `ItemUtils.createFilledResult`). `support::swap_held` shrinks the stack with `set_count` and
+  gives the produced bucket through `PlayerRef::give_stack` (vanilla's `Inventory.add`: matching
+  stacks, then an empty slot, then dropped at the player's feet), and restores the hand if that
+  fails so the caller's transaction rolls the fluid back.
+- **`support::right_click` claims the tank click for a bucket but no longer swaps the hand**; the swap
+  runs in `support::fill_bucket` (the bucket's own use), so the engine's one item use cannot repeat it.
+  The `fill_bucket` drain/fill stays in one transaction with the swap.
+- `src/runtime.rs` therefore differs from the retired file by the two rules and their tests (the
+  earlier "byte-identical" line above is history; the gate now checks the packed file equals this one).
+
+### In-game assertions (quoted from `e2e-0.2.4.log`, `PASS` + `EXIT:0`)
+
+```
+== bug 2: a tank placed from an item on a stocked frequency keeps the shared fluid ==
+  info(18,64,0): Ender Tank: red / white / white (minecraft:water 4000 mB, 4000 mB in the store)
+  info(14,64,0): Ender Tank: red / white / white (minecraft:water 4000 mB, 4000 mB in the store)
+  tanks.dat after the second tank: t red,white,white minecraft:water 4000
+== bug 1: an empty bucket drains one bucket and the rest of the stack survives ==
+  inventory after the drain: 7 empty + 1 full
+  info(20,64,0): Ender Tank: white / white / white (minecraft:water 3000 mB, 3000 mB in the store)
+  tanks.dat after the drain: t white,white,white minecraft:water 3000
+```
+
+The legs are fail-capable: `SELFTEST=1` inverts the sharing assertion and the run ends
+`FAIL` + `EXIT:1` (`e2e-0.2.4-selftest.log`); the water-bucket-at-a-tank phase (the recorded pin
+gap) and the vanilla cauldron control beside it are unchanged.
+
+### Coverage of the families this slice touches
+
+| family | what the leg does | result |
+|---|---|---|
+| tank drain by an empty-bucket stack | 8 empty buckets, one click: 7 empty + 1 full, store −1000 mB | tested (`bug 1`, `7 empty + 1 full`) |
+| tank item placement on a stocked frequency | second tank placed from a red item, both read 4000 mB, `tanks.dat` keeps it | tested (`bug 2`) |
+| tank fill by a full bucket | water bucket at a tank | `not ported` — recorded pin gap (`FluidTanks::insert` keeps no write); the leg asserts the bucket never pours and the tank stays empty |
+| vanilla bucket control | water bucket into a cauldron | tested (`water_cauldron`) |
+
+**Ladder** (every step in a `build-slot.sh` lease, `CARGO_INCREMENTAL=0`, `BUILD_LOCAL=1`):
+
+| Step | Command | Result |
+|---|---|---|
+| unit red | `cargo test --offline` with the two new tests, before implementing them | `error[E0425]: cannot find function \`tank_write\`` / `\`bucket_swap\`` (`red-0.2.4-unit.log`) |
+| tests | `cargo test --offline` | **50 passed**, 0 failed (`sdk-test.log`) |
+| lints | `cargo clippy --all-targets -- -D warnings` | exit 0, 0 warnings (`sdk-clippy.log`) |
+| format | `cargo fmt --check` | exit 0 (`sdk-fmt.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` twice | `cmp`-identical, `6509360…`, built against **0a875da** (`build-1.log`, `build-2.log`) |
+| registry check | `cargo horizon-mod check enderstorage.hmod` | `enderstorage 0.2.4 (… 0a875da…/e59da90…, for 26.3)`, **54,512 B**, sha256 `6509360807e1711a0bd2c2b77859f348926060895764f16d023b485721d9b5a7`, exit 0 (`check.log`) |
+| fits the pin | `cargo horizon-mod fits enderstorage.hmod --build 0a875da` | `0a875da  made for`, exit 0 (`fits-0a875da.log`) |
+| fits the previous build | `… --build 0b14f8a` | `0b14f8a  fits`, exit 0 (`fits-0b14f8a.log`) |
+| the gate | `python3 ports/tools/verify-sdk-package.py enderstorage` | **1/1** (50 tests, 0 warnings) |
+| in game | `build-slot.sh run … bash tools/e2e.sh` with the launcher-built 0.2.4 game | `PASS` + `EXIT:0` (`e2e-0.2.4.log`) |
+| fail-capable | `SELFTEST=1` | `FAIL` + `EXIT:1` (`e2e-0.2.4-selftest.log`) |
+| recipe/loot dialect, unchanged | `tools/e2e-dialect.sh` with the 0.2.4 artifact | `PASS` + `EXIT:0` (`e2e-dialect.log`); `SELFTEST=1` `FAIL` + `EXIT:1` (`e2e-dialect-selftest.log`) |
+| log gate | `python3 ports/tools/check-e2e-logs.py enderstorage --strict` | exit 0 (7 logs, 7 ok) |
+
+Package 0.2.4: **54,512 B**, SHA-256 `6509360807e1711a0bd2c2b77859f348926060895764f16d023b485721d9b5a7`.
+
+`tools/e2e.sh` now takes its scratch directory from `E2E_TMP` (the launcher exports one on `/home`;
+`/tmp` is a 7.5 GB tmpfs), and its bug-1 leg stocks a fresh tank through `data merge block` because
+the pin's bucket *fill* path keeps no write.
+
+Skills: superpowers/using-superpowers,systematic-debugging,test-driven-development,verification-before-completion; BeautifulRust/rust-best-practices

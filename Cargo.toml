@@ -7,7 +7,7 @@
 #
 # Cargo's name and version are not the mod's identity: horizon-mod.toml is.
 name = "enderstorage"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 license = "MIT"
 description = "EnderStorage for Horizon: ender chests and ender tanks linked by a three-colour frequency"

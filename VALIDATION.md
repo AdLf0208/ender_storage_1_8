@@ -72,3 +72,31 @@ there is no staging step: the crate compiles in place against `.horizon/sdk/`.
 | in game | `tools/e2e-dialect.sh` | `PASS` + `EXIT:0`; `SELFTEST=1` `FAIL` + `EXIT:1`; `check-e2e-logs.py enderstorage --strict` exit 0 |
 
 Changed: 2 recipes. Proof: ender_chest crafts 1; loot already correct (not touched); pre-fix red. Full record in [`notes.md`](notes.md) §"26.3 dialect sweep".
+
+## 0.2.4 — reviewer repairs: two inventory-loss cases (2026-11-21)
+
+Pin `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` (mixins `e59da90…`); every step in a
+`build-slot.sh` lease with `CARGO_INCREMENTAL=0`. Full record: [`notes.md`](notes.md)
+§ "Reviewer repairs (2026-11-21)".
+
+| Check | Command | Result |
+|---|---|---|
+| unit red | `cargo test --offline` before the two rules existed | `E0425: cannot find function \`tank_write\`` / `\`bucket_swap\`` (`../_shared/evidence/enderstorage/red-0.2.4-unit.log`) |
+| in-game red 1 | 0.2.3 game, 8 empty buckets at a stocked tank | `after: [{"item":"minecraft:bucket","count":1}]` — seven lost (`red-bug1-stack-0.2.3.log`) |
+| in-game red 2 | 0.2.3 game, tank placed from a red item on stocked red | `tanks.dat: … t red,white,white - 0` (`red-bug2-tank-0.2.3.log`) |
+| tests | `cargo test --offline` | **50 passed**, 0 failed (`sdk-test.log`) |
+| lints | `cargo clippy --all-targets -- -D warnings` | exit 0, 0 warnings (`sdk-clippy.log`) |
+| format | `cargo fmt --check` | exit 0 (`sdk-fmt.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` twice | `cmp`-identical (`build-1.log`, `build-2.log`) |
+| registry check | `cargo horizon-mod check enderstorage.hmod` | **54,512 B**, sha256 `6509360807e1711a0bd2c2b77859f348926060895764f16d023b485721d9b5a7`, exit 0 (`check.log`) |
+| fits the pin | `cargo horizon-mod fits enderstorage.hmod --build 0a875da` | `0a875da  made for`, exit 0 (`fits-0a875da.log`) |
+| fits another build | `… --build 0b14f8a` | `0b14f8a  fits`, exit 0 (`fits-0b14f8a.log`) |
+| the gate | `python3 ports/tools/verify-sdk-package.py enderstorage` | 1/1 |
+| in game | `tools/e2e.sh` on the launcher-built 0.2.4 game | `PASS` + `EXIT:0` (`e2e-0.2.4.log`) |
+| fail-capable | `SELFTEST=1` | `FAIL` + `EXIT:1` (`e2e-0.2.4-selftest.log`) |
+| log gate | `check-e2e-logs.py enderstorage --strict` | exit 0 |
+
+Changed: `runtime::tank_write` + `bucket_swap` (with tests), `support::tick_tank`,
+`support::swap_held`, `support::right_click`/`fill_bucket` (the swap moved into the bucket's own
+use), `tools/e2e.sh` (two new legs, `E2E_TMP`, the fresh-tank stock). `src/runtime.rs` is no longer
+byte-identical to the retired file: the two rules and their tests are the difference.
