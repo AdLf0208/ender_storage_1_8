@@ -450,6 +450,34 @@ pub fn sync<T: Slot>(
     }
 }
 
+/// How far from a block a player without operator rights may still read it: the vanilla
+/// block-interaction reach (4.5 blocks) plus slack, from the player's position to the block
+/// centre. `/enderstorage info` names a frequency — the key that joins a public linked store — so
+/// a remote read has to be an operator's.
+pub const READ_REACH: f64 = 6.0;
+
+/// Whether a command source may read the block at `pos`.
+///
+/// `operator` is the source's permission level reaching 2; a player below it may read only a
+/// block within [`READ_REACH`], and a non-player source without it reads nothing.
+#[must_use]
+pub fn may_read(operator: bool, player: Option<[f64; 3]>, pos: [i32; 3]) -> bool {
+    if operator {
+        return true;
+    }
+    player.is_some_and(|player| {
+        let centre = [
+            f64::from(pos[0]) + 0.5,
+            f64::from(pos[1]) + 0.5,
+            f64::from(pos[2]) + 0.5,
+        ];
+        let distance_squared: f64 = (0..3)
+            .map(|axis| (player[axis] - centre[axis]).powi(2))
+            .sum();
+        distance_squared <= READ_REACH * READ_REACH
+    })
+}
+
 /// One slot's merge: the value the store should hold and the value the chest
 /// should show.
 ///
@@ -910,6 +938,34 @@ mod tests {
             slots[index] = stack(count);
         }
         slots
+    }
+
+    #[test]
+    fn only_an_operator_or_a_nearby_player_reads_a_frequency() {
+        // The frequency is the key to a public linked store, so `/enderstorage info` answers a
+        // player only when they can touch the block, and a non-player source only at level 2.
+        let pos = [10, 64, 10];
+        assert!(may_read(true, Some([500.0, 64.0, 500.0]), pos));
+        assert!(may_read(false, Some([13.0, 64.5, 10.5]), pos));
+        assert!(!may_read(false, Some([10.5, 64.5, 17.0]), pos));
+        assert!(!may_read(false, None, pos));
+        assert!(may_read(false, Some([10.5 + READ_REACH, 64.5, 10.5]), pos));
+    }
+
+    #[test]
+    fn a_sibling_that_has_not_changed_adopts_the_committed_withdrawal() {
+        // A chest's inventory is a copy of the frequency; a sibling keeps its copy between ticks.
+        // The fix commits an access to the store at once and pushes the store's slots into every
+        // loaded sibling, so this is what a sibling's next merge must see: the committed value,
+        // never the stale stack it still held.
+        let mut store = Store::new();
+        store.set(RED, stacks(&[(0, 64)]));
+        let before = stacks(&[(0, 64)]);
+        assert!(commit(&vec![None; SLOTS], Some(&before), &mut store, RED));
+        assert_eq!(store.slots(RED)[0], None);
+        let sibling = sync(&before, Some(&before), &mut store, RED);
+        assert_eq!(sibling.items[0], None, "the sibling hands out nothing");
+        assert_eq!(store.slots(RED)[0], None);
     }
 
     #[test]

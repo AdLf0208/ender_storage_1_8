@@ -1,0 +1,13 @@
+{
+  "recipe": {
+    "file": "data/enderstorage/recipe/ender_chest.json",
+    "tag_items": {
+      "#minecraft:wool": "minecraft:white_wool"
+    },
+    "expect": {
+      "id": "enderstorage:ender_chest",
+      "count": 1
+    },
+    "consume": "minecraft:ender_pearl"
+  }
+}

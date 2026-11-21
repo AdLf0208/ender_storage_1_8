@@ -13,7 +13,7 @@
 //! The 0.2.0 package replaced the retired `.hnmod` bundle; the mapping from the old hook helpers to
 //! this module is in `notes.md` under `## Migration to the SDK format`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ use mod_api::{
 
 use crate::runtime::{
     BUCKET, Band, Colour, Frequency, SLOTS, Slot, Store, TANK_CAPACITY, Tank, TankStore, commit,
-    commit_tank, switch, switch_tank, sync, sync_tank,
+    commit_tank, may_read, switch, switch_tank, sync, sync_tank,
 };
 
 /// The chest block and its item; the tank block and its item (each pair shares one id).
@@ -40,6 +40,9 @@ const BLOCK: &str = "enderstorage:ender_chest";
 const ITEM: &str = "enderstorage:ender_chest";
 const TANK: &str = "enderstorage:ender_tank";
 const TANK_ITEM: &str = "enderstorage:ender_tank";
+/// `Inventory`'s off-hand slot (`player_inventory_slots`' numbers).
+const OFF_HAND: u32 = 40;
+
 /// The item component that carries a frequency (`component_types`).
 pub const COMPONENT: &str = "enderstorage:frequency";
 /// The store lives beside the world, so backups and the world travel together.
@@ -243,6 +246,139 @@ fn write_stack_frequency(stack: &mut ItemStack, frequency: Frequency) -> bool {
 // The port's state
 // ---------------------------------------------------------------------------
 
+/// How many sibling chests one access aligns.
+const SYNC_MIRRORS_PER_ACCESS: usize = 16;
+
+/// One loaded chest of a frequency: where it is, and the server tick it last ticked in.
+#[derive(Clone, Debug)]
+struct Mirror {
+    tick: u64,
+    dimension: String,
+    pos: [i32; 3],
+}
+
+thread_local! {
+    /// Set while one access is being pushed into the other mirrors, so those mirrors' own notices
+    /// do not push it back: without it two chests of one frequency would notify each other forever
+    /// on the server thread.
+    static SYNCING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Commit one chest's access to the store and align every other loaded mirror of the frequency.
+fn on_contents_changed(host: &mut dyn ServerHost, pos: mod_api::BlockPos) {
+    if SYNCING.with(std::cell::Cell::get) {
+        return;
+    }
+    SYNCING.with(|flag| flag.set(true));
+    push_access(host, pos);
+    SYNCING.with(|flag| flag.set(false));
+}
+
+/// The body of [`on_contents_changed`], under the re-entrancy guard.
+fn push_access(host: &mut dyn ServerHost, pos: mod_api::BlockPos) {
+    let pos = [pos.x, pos.y, pos.z];
+    let Some(level) = host.level(host.dimension()) else {
+        return;
+    };
+    let Some(entity) = our_entity(&*host, level, pos, BLOCK) else {
+        return;
+    };
+    let Some(mut data) = entity.data(&*host) else {
+        return;
+    };
+    let frequency = be_frequency(&mut data);
+    let uid = be_uid(&mut data);
+    let current = stored_slots(&*host, &read_slots(&*host, entity));
+    let seats: Vec<(u64, String, [i32; 3])> = {
+        let mut guard = core();
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        let snapshot = state.snapshots.get(&uid).cloned();
+        let committed = commit(&current, snapshot.as_deref(), &mut state.store, frequency);
+        if committed {
+            state.dirty = true;
+        }
+        state.snapshots.insert(uid, state.store.slots(frequency));
+        let limit = SYNC_MIRRORS_PER_ACCESS;
+        state
+            .mirrors
+            .get(&frequency)
+            .map(|mirrors| {
+                mirrors
+                    .iter()
+                    .filter(|(other, _)| **other != uid)
+                    .take(limit)
+                    .map(|(id, mirror)| (*id, mirror.dimension.clone(), mirror.pos))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if seats.is_empty() {
+        return;
+    }
+    let slots = {
+        let guard = core();
+        guard
+            .as_ref()
+            .map(|state| state.store.slots(frequency))
+            .unwrap_or_default()
+    };
+    let stacks = stacks(&*host, &slots);
+    for (other, dimension, at) in seats {
+        if dimension != host.dimension() {
+            continue;
+        }
+        let Some(level) = host.level(&dimension) else {
+            continue;
+        };
+        let Some(entity) = our_entity(&*host, level, at, BLOCK) else {
+            continue;
+        };
+        let _ = host.transaction(|host, tx| -> Result<(), ()> {
+            for (slot, stack) in stacks.iter().enumerate() {
+                let _ = entity.set_item_slot(
+                    host,
+                    tx,
+                    u32::try_from(slot).unwrap_or(u32::MAX),
+                    stack.clone(),
+                );
+            }
+            Ok(())
+        });
+        let mut guard = core();
+        if let Some(state) = guard.as_mut() {
+            state.snapshots.insert(other, slots.clone());
+        }
+    }
+}
+
+/// Register this chest as a loaded mirror of `frequency` for the current tick.
+///
+/// Every loaded chest ticks every tick, so a uid that has not ticked for two ticks is unloaded,
+/// broken or retuned. The registry is what lets an access on one chest push the store's state into
+/// its siblings at once; Horizon gives each block entity its own inventory, so without that push a
+/// sibling keeps a stale copy between ticks and can hand out items the store no longer holds.
+fn register_mirror(
+    state: &mut Core,
+    frequency: Frequency,
+    uid: u64,
+    dimension: &str,
+    pos: [i32; 3],
+) {
+    let tick = state.ticks;
+    let mirrors = state.mirrors.entry(frequency).or_default();
+    mirrors.retain(|_, seen| tick.saturating_sub(seen.tick) <= 1);
+    mirrors.insert(
+        uid,
+        Mirror {
+            tick,
+            dimension: dimension.to_owned(),
+            pos,
+        },
+    );
+}
+
 /// The port's state: the store, each chest's last synced slots, and the work a hook defers.
 struct Core {
     world: Option<PathBuf>,
@@ -256,6 +392,10 @@ struct Core {
     snapshots: HashMap<u64, Vec<Option<StoredItem>>>,
     /// Frequencies a chest must take: from its item on placement, or a command.
     pending: Vec<(String, [i32; 3], Frequency)>,
+    /// The loaded chests of each frequency, by uid: where each is, and the server tick it last
+    /// ticked in. An access on one chest pushes the store's slots into these siblings at once, so
+    /// none of them can hand out contents the store no longer holds.
+    mirrors: BTreeMap<Frequency, BTreeMap<u64, Mirror>>,
     /// The frequency of a chest that just broke, for its item's drop.
     broken: HashMap<(String, [i32; 3]), Frequency>,
     dirty: bool,
@@ -273,6 +413,7 @@ impl Default for Core {
             tank_snapshots: HashMap::new(),
             snapshots: HashMap::new(),
             pending: Vec::new(),
+            mirrors: BTreeMap::new(),
             broken: HashMap::new(),
             dirty: false,
             tanks_dirty: false,
@@ -549,9 +690,9 @@ pub fn declare(r: &mut dyn Registrar) {
     // the *block entity type* (each server tick).
     r.block_part(chest, Chest);
     r.block_part(tank, TankPart);
-    r.block_entity_part(&chest_kind, Chest)
+    r.block_entity_part(&chest_kind, ChestEntity)
         .expect("the chest's Part attaches to the type this mod just declared");
-    r.block_entity_part(&tank_kind, TankPart)
+    r.block_entity_part(&tank_kind, TankEntity)
         .expect("the tank's Part attaches to the type this mod just declared");
     r.block_container(&chest, container());
     r.block_fluids(&tank, tanks());
@@ -612,10 +753,29 @@ pub fn declare_commands(commands: &mut Vec<Command>) {
 pub struct Chest;
 
 #[mod_api::horizon_part]
-impl BlockPart for Chest {}
+impl BlockPart for Chest {
+    /// A chest's inventory changed outside its tick: a player's menu or a hopper. Commit the change
+    /// to the shared store **at once** and push the result into every other loaded chest of the
+    /// frequency, so no sibling can hand out contents the store no longer holds between ticks.
+    fn contents_changed(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut mod_api::ContentsChangedEvent,
+    ) {
+        on_contents_changed(host, event.pos);
+    }
+}
+
+/// The chest's block-entity Part: a **separate type** from the block Part, because the engine
+/// refuses one part type attached to a block id twice and a block-entity part registers against
+/// the block it belongs to.
+pub struct ChestEntity;
 
 #[mod_api::horizon_part]
-impl BlockEntityPart for Chest {
+impl BlockPart for ChestEntity {}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for ChestEntity {
     /// The chest ticks on the server (`EntityBlock.getTicker`).
     fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
         event.ticks = true;
@@ -632,8 +792,14 @@ pub struct TankPart;
 #[mod_api::horizon_part]
 impl BlockPart for TankPart {}
 
+/// The tank's block-entity Part, separate from its block Part for the same reason.
+pub struct TankEntity;
+
 #[mod_api::horizon_part]
-impl BlockEntityPart for TankPart {
+impl BlockPart for TankEntity {}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for TankEntity {
     fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
         event.ticks = true;
     }
@@ -697,6 +863,7 @@ fn tick_chest(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
                 frequency = wanted;
             }
         }
+        register_mirror(state, frequency, uid, &dimension, pos);
         let snapshot = state.snapshots.get(&uid).cloned();
         let synced = sync(&out, snapshot.as_deref(), &mut state.store, frequency);
         if synced.store_changed {
@@ -1084,13 +1251,18 @@ pub fn fill_bucket(host: &mut dyn ServerHost, event: &mut mod_api::FillBucketEve
     let empty = event.stack.item().id(&*host) == BUCKET_ITEM;
     let player = host.players().acting_player();
     if let Some(player) = player {
+        // The fluid and the hand exchange are one change: a failed bucket swap aborts the
+        // transaction, so a tank is never mutated without the player's bucket changing with it.
         let _ = host.transaction(|host, tx| {
-            if let Some(fluid) = fluid {
-                fill_tank(host, tx, level, pos, fluid, player);
+            let done = if let Some(fluid) = fluid {
+                event.stack.item().id(&*host) == fluid_bucket(fluid).unwrap_or_default()
+                    && fill_tank(host, tx, level, pos, fluid, player)
             } else if empty {
-                drain_tank(host, tx, level, pos, None, player);
-            }
-            Ok::<bool, ()>(true)
+                drain_tank(host, tx, level, pos, None, player)
+            } else {
+                false
+            };
+            if done { Ok::<bool, ()>(true) } else { Err(()) }
         });
     }
     // The tank owns the pour either way, so a full tank never empties the bucket beside the block.
@@ -1146,17 +1318,19 @@ fn tank_bucket_click(
     if !empty && filled_with.is_none() {
         return false;
     }
-    let _ = host.transaction(|host, tx| {
-        if let Some(fluid) = filled_with {
+    let done = host.transaction(|host, tx| {
+        let done = if let Some(fluid) = filled_with {
             // A filled bucket: one bucket in and the held stack becomes an empty bucket. A tank
             // that will not take the whole bucket leaves both alone, and the click is still ours.
-            fill_tank(host, tx, level, pos, fluid, player);
-            return Ok::<bool, ()>(true);
-        }
-        // An empty bucket: only a whole bucket fills a bucket, so a partly filled tank refuses.
-        drain_tank(host, tx, level, pos, Some(direction), player);
-        Ok(true)
+            fill_tank(host, tx, level, pos, fluid, player)
+        } else {
+            // An empty bucket: only a whole bucket fills a bucket, so a partly filled tank
+            // refuses.
+            drain_tank(host, tx, level, pos, Some(direction), player)
+        };
+        if done { Ok::<bool, ()>(true) } else { Err(()) }
     });
+    let _ = done;
     true
 }
 
@@ -1196,10 +1370,12 @@ fn fill_tank(
         }
         return false;
     }
-    if let Some(bucket) = fluid_bucket(fluid) {
-        set_held_item(host, player, bucket, BUCKET_ITEM);
+    // The bucket swap is part of the same change: if the player's hand does not take the empty
+    // bucket, the fill is rolled back by the caller instead of leaving fluid behind for free.
+    match fluid_bucket(fluid) {
+        Some(bucket) => swap_held(host, player, bucket, BUCKET_ITEM),
+        None => false,
     }
-    true
 }
 
 /// Take one whole bucket out of the tank at `pos` into the held empty bucket; whether it came out.
@@ -1236,14 +1412,8 @@ fn drain_tank(
         _ => String::new(),
     };
     match fluid_bucket(&name) {
-        Some(bucket) => {
-            set_held_item(host, player, BUCKET_ITEM, bucket);
-            true
-        }
-        None => {
-            let _ = tanks.insert(host, tx, 0, &resource, want);
-            false
-        }
+        Some(bucket) => swap_held(host, player, BUCKET_ITEM, bucket),
+        None => false,
     }
 }
 
@@ -1252,20 +1422,49 @@ fn bucket_volume() -> u32 {
     u32::try_from(BUCKET).unwrap_or(1_000)
 }
 
-/// Replace one held `from` with one `to` (a bucket swap), in the player's selected slot.
-fn set_held_item(host: &mut dyn ServerHost, player: PlayerRef, from: &str, to: &str) {
-    let Some((slot, stack)) = held(host, player) else {
-        return;
+/// Replace one held `from` with one `to` (a bucket swap) in the hand that holds it, and answer
+/// whether the slot write succeeded.
+///
+/// The hand is read from the inventory, not assumed: the selected hotbar slot first, then the off
+/// hand (`Inventory`'s 40), then any other slot still holding the item. `fill_bucket` has no hand
+/// in its event, so an off-hand fill used to edit the main hand — leaving the off-hand bucket
+/// unchanged and the main-hand item destroyed. The swap fails (rather than silently doing
+/// nothing) when the item is not there or the write is refused, so the caller rolls the fluid
+/// change back.
+fn swap_held(host: &mut dyn ServerHost, player: PlayerRef, from: &str, to: &str) -> bool {
+    let Some(slot) = holding_slot(host, player, from) else {
+        return false;
     };
-    if stack.item().id(&*host) != from {
-        return;
-    }
     let Some(key) = Identifier::parse(to).ok().and_then(|id| host.item_key(&id)) else {
-        return;
+        return false;
     };
-    if let Some(stack) = ItemStack::new(key, 1) {
-        let _ = player.set_inventory_slot(host, slot, Some(stack));
+    let Some(stack) = ItemStack::new(key, 1) else {
+        return false;
+    };
+    player.set_inventory_slot(host, slot, Some(stack)).is_ok()
+}
+
+/// The slot holding `item`: the selected slot, then the off hand, then any other slot.
+fn holding_slot(host: &dyn ServerHost, player: PlayerRef, item: &str) -> Option<u32> {
+    let selected = u32::try_from(player.selected_slot(host)?).ok();
+    let slots = player.inventory_slots(host)?;
+    let holds = |slot: u32| {
+        slots
+            .iter()
+            .any(|(at, stack)| *at == slot && stack.item().id(host) == item)
+    };
+    if let Some(slot) = selected
+        && holds(slot)
+    {
+        return Some(slot);
     }
+    if holds(OFF_HAND) {
+        return Some(OFF_HAND);
+    }
+    slots
+        .iter()
+        .find(|(_, stack)| stack.item().id(host) == item)
+        .map(|(slot, _)| *slot)
 }
 
 /// The player's main-hand stack and the slot it is in.
@@ -1493,6 +1692,15 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
                 say(host, "Usage: /enderstorage info <x> <y> <z>");
                 return Flow::Cancel;
             };
+            // The readout names the block's frequency and its occupancy. The frequency is enough
+            // to join a public linked store, so it is not a remote read for an ordinary player:
+            // an operator reads any block, a player only one within reach, and any other
+            // non-operator source nothing.
+            let (operator, reader) = reader(&*host, event.source);
+            if !may_read(operator, reader, pos) {
+                say(host, "That block is out of reach.");
+                return Flow::Cancel;
+            }
             let readout = readout(host, pos);
             say(host, &readout);
         }
@@ -1529,6 +1737,17 @@ fn block_pos(invocation: &CommandInvocation, name: &str) -> Option<[i32; 3]> {
         CommandArgumentValue::BlockPos(pos) => Some(*pos),
         _ => None,
     }
+}
+
+/// The source's right to read a block: whether its permission reaches the operator level (2, the
+/// level the frequency-changing command requires) and the player's position when it is a player.
+fn reader(host: &dyn ServerHost, source: &CommandSource) -> (bool, Option<[f64; 3]>) {
+    let operator = source.permission().level() >= 2;
+    let player = match source {
+        CommandSource::Player { player, .. } => player.entity().position(host),
+        _ => None,
+    };
+    (operator, player)
 }
 
 /// The player a command came from.

@@ -173,6 +173,70 @@ upstream's 1.21.1 command file is commented out):
     slots (`destroy_block`/`explosion_detonate` run before removal); the store
     already holds the items, so nothing is lost.
 
+## Review fixes (2026-11-18, package 0.2.2)
+
+The reviewer's source review of PR #1211 (`var/review-all/1211-enderstorage.md`, **held**) left three
+findings. All three are fixed in **0.2.2** (`53233 B`, sha256 `38aa56337e172376ca638088617f26e40a728781e6303ea38a11fccfd5d586ac`), and the in-game leg is
+green.
+
+- **`src/runtime.rs:490` — next-tick reconciliation let two chest mirrors each dispense the same
+  stock before either ticked.** `Hooks` now hears `contents_changed` on the chest: an access commits
+  its count delta to the shared store **at the point of access** (`runtime::commit`, the same
+  `merge_slot` delta the tick uses) and pushes the store's slots into every other loaded chest of the
+  frequency at once (up to `SYNC_MIRRORS_PER_ACCESS`, from a registry each chest's tick fills), with
+  a thread-local re-entrancy guard so two siblings cannot notify each other forever. Test:
+  `runtime::tests::a_sibling_that_has_not_changed_adopts_the_committed_withdrawal`.
+- **`src/support.rs:608` — `/enderstorage info` revealed a chest's or tank's frequency (and its
+  occupancy) at arbitrary coordinates.** The readout is gated on the ordinary interaction rules
+  (`runtime::may_read`): an operator reads any block, a player only one within `READ_REACH`
+  (6 blocks, the vanilla reach plus slack), any other non-operator source nothing. Test:
+  `runtime::tests::only_an_operator_or_a_nearby_player_reads_a_frequency`. The e2e reads only with
+  the player beside the block (no operator), and restores the player's position after each read.
+- **`src/support.rs:1087` — the bucket hook committed a tank change while `set_held_item` edited only
+  the selected main-hand slot and dropped its failure result.** `swap_held` finds the hand actually
+  holding the item (selected slot, then the off hand 40, then any slot) and answers whether the write
+  succeeded; the bucket click now performs the tank change and the hand exchange in **one
+  transaction**, and a failed exchange aborts it, so the tank and the bucket change together or not
+  at all.
+
+Two further defects the run exposed, fixed here:
+
+- **The package did not load.** `Chest`/`TankPart` were attached as both the block and the
+  block-entity Part; the engine refuses one part type attached to a block id twice
+  (`Chest is attached to enderstorage:ender_chest twice`). The block-entity halves are now
+  `ChestEntity`/`TankEntity`.
+- **`--headless` hung `ctl screen`** once the 27-slot menu opened (the game answered `state` but never
+  `screen`; the guard now bounds every `ctl`, so this cannot masquerade as a pass). The leg launches
+  `--offscreen`, which answers the menu; recorded here as a harness change.
+
+**In-game leg:** `ports/tools/launcher-game.sh build enderstorage --rebuild` then
+`run enderstorage` → `PASS` + `E2E EXIT:0`; the same leg on the unmodified Nightly fails at the
+first sharing assertion (`EXIT:1`). `check-e2e-logs.py enderstorage-e2e --strict` exit 0. Evidence:
+`ports/_shared/evidence/enderstorage-e2e/`.
+
+## Gap: the declared tank at `0b14f8a` (measured, not worked around)
+
+A bucket emptied into a mod-declared fluid tank does not keep its fluid at this pin, so the tank
+section asserts what the mod does here (the tank stays empty, nothing is poured into the world) and
+not a fill it cannot show. Measured on the launcher-built game:
+
+- Inside the bucket event, `FluidTanks::insert` over `horizon:fluids`
+  (`block/fluid_capability.rs`, `fluid_tank_insert`) reports `inserted=1000/1000` and
+  `amount=1000`, but cancelling the event (which the mod must do, so a full tank never pours into
+  the world) takes the write back with the event's transaction.
+- From `ServerTickEnd`, outside any cancelled event: a 1000 mB insert leaves the tank at 0 after the
+  tick; a 500 mB insert is kept once and a second 500 mB is refused; a 250 mB insert is not kept at
+  all. Re-inserting the amount inside the same transaction reproduces the loss, and a 1 mB marker
+  written from the service path is not kept either, so the loss is the capability's, not the
+  merge's.
+- The engine's own bucket path empties the item anyway (`inventory_change: bucket +1,
+  water_bucket -1`), so the player's fluid is lost before any mod hook can refuse it.
+
+Consequence for users: at this pin an Ender Tank accepts the click, the tank reads empty and the
+bucket is consumed; the port neither stores nor pours the fluid. The e2e pins that behaviour, so a
+pin that keeps the fluid makes this section fail and it must be rewritten to the real assertion
+(`minecraft:water 1000 mB` on both tanks of the channel, then a bucket drained back).
+
 ## Verification
 
 See the sections appended below after the build and the in-game run.
@@ -691,3 +755,46 @@ format:
 > dye pads, grid crafting that carries colours, custom renderers).
 
 Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-port
+
+## 26.3 dialect sweep (2026-11-21) — carried recipes and loot tables, proven in game (0.2.3)
+
+The shared checker `ports/tools/check_261_dialect.py` (generalised from `ports/modularrouters/tools/data_shape.py`
+and `ports/createaddition/tools/data_shape.py`) found the 1.21.1 forms still in the package that had shipped
+at **0.2.2**; `cargo horizon-mod check`, `fits` and every unit test had passed on them, and the content
+was dead in game (a recipe returns nothing; a block drops empty).
+
+| Family | Files | 1.21.1 form that shipped | 26.3 form |
+|---|---|---|---|
+| recipe ingredients | 2 (`ender_chest`, `ender_tank`): `{"item": …}` / `{"tag": "minecraft:wool"}` in `key` | `{"item": "…"}` / `{"tag": "…"}` | `"minecraft:…"` / `"#c:…"` |
+| loot pools | none (both tables already used the singular 26.3 condition and integral rolls) | `"conditions": [ … ]`, `bonus_rolls`, `"rolls": 1.0` | one `"condition": {"type": "minecraft:…"}`, no `bonus_rolls`, `"rolls": 1` |
+
+The loot phase reports n/a; both carried tables were already in the 26.3 shape and were not touched.
+
+**Red, kept:** `ports/_shared/evidence/enderstorage/dialect-check-red.log` — the checker exits 1 on the pre-fix
+package itself (`dialect-prefix-0.2.2.hmod`, 0.2.2, kept in the same folder), naming every file.
+A reconstructed fixture carrying all three loot shapes plus a `requires_tool` block with no mineable tag is
+red too (`../../morered/dialect-check-fixture-red.log`). The checker's `--selftest` fails when any shape is
+accepted.
+
+  `recipe ender_chest.json: crafting_shaped -> {"count": 1, "item": "enderstorage:ender_chest", "slot": 200}`; `the result reached the inventory (1 enderstorage:ender_chest), the grid emptied, and minecraft:ender_pearl was consumed`
+
+  `n/a: this port's loot tables were already in the 26.3 form`
+
+The in-game leg is `tools/e2e-dialect.sh` (`ports/_shared/evidence/enderstorage/e2e-dialect.log`): `PASS` + `EXIT:0`,
+and `SELFTEST=1` inverts the expectation and ends `FAIL` + `EXIT:1` (`e2e-dialect-selftest.log`).
+`check-e2e-logs.py enderstorage --strict` exits 0.
+
+**Ladder** (all in `build-slot.sh` leases, `CARGO_INCREMENTAL=0`, `BUILD_LOCAL=1`):
+
+| Step | Command | Result |
+|---|---|---|
+| tests | `cargo test --offline` | **49 passed**, 0 failed (`dialect-test.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` (twice) | built against **0a875da** (re-pinned from 0b14f8a), second build `cmp`-identical (`dialect-build-1.log`, `dialect-build-2.log`) |
+| registry check | `cargo horizon-mod check enderstorage.hmod` | `enderstorage 0.2.3 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, **53,203 B**, sha256 `9ad59a8b9d09…` (`dialect-check.log`) |
+| fits the pin | `cargo horizon-mod fits enderstorage.hmod --build 0a875da` | `0a875da  made for`, exit 0 (`dialect-fits-0a875da.log`) |
+| fits the previous build | `… --build 0b14f8a` | `fits`, exit 0 (`dialect-fits-0b14f8a.log`) |
+| the gate | `python3 ports/tools/verify-sdk-package.py enderstorage` | **1/1** (`dialect-gate.log`) |
+
+Package 0.2.3: **53,203 B**, SHA-256 `9ad59a8b9d0981471497eea8e26196b1b1460e0327b7bb298148c3229a8f62b7`.
+
+Skills: superpowers/using-superpowers,systematic-debugging,test-driven-development,verification-before-completion; BeautifulRust/none (no Rust change)

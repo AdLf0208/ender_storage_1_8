@@ -58,3 +58,17 @@ there is no staging step: the crate compiles in place against `.horizon/sdk/`.
 (`horizon-launcher native-build`) and `horizon-launcher` is not installed in this environment; the
 0.1.0/2026-11-11 `PASS`/`EXIT:0` runs remain the behaviour's evidence. See
 `notes.md § "Gaps after the migration"`.
+
+## 26.3 dialect sweep (2026-11-21) — 0.2.3
+
+| Check | Command | Result |
+|---|---|---|
+| static dialect | `python3 ports/tools/check_261_dialect.py enderstorage.hmod` | exit 0; pre-fix package exit 1 (`../_shared/evidence/enderstorage/dialect-check-red.log`) |
+| tests | `cargo test --offline` | exit 0 (`dialect-test.log`) |
+| package | `cargo horizon-mod build` twice after `rm -f Cargo.lock` | `cmp`-identical, built against 0a875da |
+| registry check | `cargo horizon-mod check enderstorage.hmod` | **53,203 B**, SHA-256 `9ad59a8b9d0981471497eea8e26196b1b1460e0327b7bb298148c3229a8f62b7`, exit 0 |
+| fits the pin | `cargo horizon-mod fits enderstorage.hmod --build 0a875da` | `0a875da  made for`, exit 0 |
+| the gate | `python3 ports/tools/verify-sdk-package.py enderstorage` | 1/1 |
+| in game | `tools/e2e-dialect.sh` | `PASS` + `EXIT:0`; `SELFTEST=1` `FAIL` + `EXIT:1`; `check-e2e-logs.py enderstorage --strict` exit 0 |
+
+Changed: 2 recipes. Proof: ender_chest crafts 1; loot already correct (not touched); pre-fix red. Full record in [`notes.md`](notes.md) §"26.3 dialect sweep".
